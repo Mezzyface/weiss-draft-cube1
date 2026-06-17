@@ -1,0 +1,6 @@
+*.db-journal
+*.bak
+.DS_Store
+__pycache__/
+*.pyc
+cards.db
