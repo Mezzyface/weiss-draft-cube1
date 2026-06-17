@@ -4,3 +4,8 @@
 __pycache__/
 *.pyc
 cards.db
+
+# Synthadoc: generated card sources contain Bushiroad card text (not redistributed),
+# and the compiled wiki / exports are large derived artifacts.
+synthadoc_sources/
+exports/
