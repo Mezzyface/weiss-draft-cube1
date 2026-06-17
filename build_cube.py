@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Build cube.db (Toyo-model v2). Entry: (cardno, cube_color, section, role, count, notes).
 Baked-in change per card: all traits + all name references universal; color reassigned to balance.
-Template per color: Lv0 18 / Lv1 12 / Lv2 6 / Lv3 10 / Event 4 = 50."""
-import sqlite3
+Template per color: Lv0 18 / Lv1 12 / Lv2 6 / Lv3 10 / Event 4 = 50.
+
+When cards.db is absent the script falls back to the existing data/cube.db for card details,
+then rewrites it and updates the const P={} payload in index.html."""
+import json, re, sqlite3
 from pathlib import Path
 
 SRC = Path(__file__).with_name("cards.db")
-OUT = Path(__file__).with_name("cube.db")
+OUT = Path(__file__).parent / "data" / "cube.db"
+HTML = Path(__file__).with_name("index.html")
 UNI = "all traits + all name references universal"
 COLORS = ["Yellow", "Blue", "Red", "Green"]
 
@@ -103,18 +107,104 @@ CUBE = [
     ("OSK/S107-E029", "Green", "Event", "L3 modal - search CX / ramp->stock / pay-4 burn",2, UNI),
 ]
 
+def _load_fallback_cache():
+    """Pre-load card details from the existing cube.db when cards.db is absent."""
+    if not OUT.exists():
+        return {}
+    cache = {}
+    try:
+        db = sqlite3.connect(OUT)
+        for row in db.execute(
+            "SELECT cardno, name, printed_color, level, cost, power, soul, trigger, ability, image_url FROM cube"
+        ):
+            cardno, name, pc, lv, cost, pw, soul, trig, ab, img = row
+            base = cardno.split(" [")[0]
+            if base not in cache:
+                cache[base] = (name, pc, lv, cost, pw, soul, trig, ab, img)
+        db.close()
+    except Exception:
+        pass
+    return cache
+
+
+def update_html(db_path: Path, html_path: Path):
+    """Regenerate the const P={...} payload baked into index.html."""
+    LEANS = {"Yellow": "Events / direct effects", "Blue": "Markers / tempo",
+              "Red": "Memory", "Green": "Stock / ramp"}
+    SECTION_ORDER = ["Lv0", "Lv1", "Lv2", "Lv3", "Event"]
+
+    db = sqlite3.connect(db_path)
+
+    # Core (given) cards — deduplicated, strip color-suffix from cardno
+    core, seen = [], set()
+    for row in db.execute(
+        "SELECT cardno, name, printed_color, bundle_count, role, image_url "
+        "FROM cube WHERE availability='given' ORDER BY cardno"
+    ):
+        cardno, name, pc, cnt, role, img = row
+        base = cardno.split(" [")[0]
+        if base not in seen:
+            seen.add(base)
+            core.append({"cardno": base, "name": name, "printed_color": pc,
+                         "bundle_count": cnt, "role": role, "image_url": img})
+
+    # Per-color drafted cards, preserving section order
+    data = {}
+    for color in COLORS:
+        rows = db.execute(
+            "SELECT cardno, name, cube_color, printed_color, section, bundle_count, role, "
+            "level, cost, power, soul, trigger, image_url "
+            "FROM cube WHERE cube_color=? AND availability='drafted'", (color,)
+        ).fetchall()
+        ordered = sorted(rows, key=lambda r: (SECTION_ORDER.index(r[4]) if r[4] in SECTION_ORDER else 99, r[0]))
+        data[color] = [
+            {"cardno": no, "name": nm, "cube_color": cc, "printed_color": pc, "section": sec,
+             "bundle_count": cnt, "role": role, "level": lv, "cost": cost, "power": pw,
+             "soul": soul, "trigger": trig, "image_url": img}
+            for no, nm, cc, pc, sec, cnt, role, lv, cost, pw, soul, trig, img in ordered
+        ]
+    db.close()
+
+    P = {"colors": COLORS, "leans": LEANS, "data": data, "core": core}
+    p_json = "const P=" + json.dumps(P, separators=(",", ":"), ensure_ascii=False) + ";"
+    html = html_path.read_text(encoding="utf-8")
+    new_html = re.sub(r"const P=\{.*?\};", p_json, html, count=1, flags=re.DOTALL)
+    html_path.write_text(new_html, encoding="utf-8")
+    print("index.html updated")
+
+
 def main():
-    src = sqlite3.connect(SRC); out = sqlite3.connect(OUT)
+    fallback = {}
+    src = None
+    if SRC.exists() and SRC.stat().st_size > 0:
+        try:
+            test = sqlite3.connect(SRC)
+            test.execute("SELECT 1 FROM cards LIMIT 1")
+            test.close()
+            src = sqlite3.connect(SRC)
+            print("Using cards.db for card details")
+        except Exception:
+            print("cards.db exists but has no cards table — using cube.db fallback")
+    if src is None:
+        fallback = _load_fallback_cache()
+        print("cards.db not found — using existing cube.db as fallback for card details")
+
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    out = sqlite3.connect(OUT)
     out.execute("DROP TABLE IF EXISTS cube")
     out.execute("CREATE TABLE cube (cardno TEXT PRIMARY KEY, name TEXT, cube_color TEXT, "
         "printed_color TEXT, section TEXT, availability TEXT, bundle_count INTEGER, role TEXT, "
         "level TEXT, cost TEXT, power TEXT, soul TEXT, trigger TEXT, ability TEXT, relabel_notes TEXT, image_url TEXT)")
     for cardno, cube_color, section, role, count, notes in CUBE:
-        row = src.execute("SELECT name,color,level,cost,power,soul,trigger,ability,image_url "
-            "FROM cards WHERE cardno=?", (cardno,)).fetchone()
+        row = None
+        if src is not None:
+            row = src.execute("SELECT name,color,level,cost,power,soul,trigger,ability,image_url "
+                "FROM cards WHERE cardno=?", (cardno,)).fetchone()
         if not row:
             if cardno in JP_EXTRA:
                 row = JP_EXTRA[cardno]
+            elif cardno in fallback:
+                row = fallback[cardno]
             else:
                 print("!! not found:", cardno); continue
         name, pcolor, lv, cost, pw, soul, trig, ab, img = row
@@ -133,7 +223,10 @@ def main():
         for s,k in out.execute("SELECT section,SUM(bundle_count) FROM cube WHERE cube_color=? GROUP BY section",(color,)): print("   ",s,k)
     print("recolored:")
     for r in out.execute("SELECT name,printed_color,cube_color FROM cube WHERE cube_color!=printed_color AND cube_color NOT IN ('Generic','All')"): print("  ",r[0],"(",r[1],"->",r[2],")")
-    out.close(); src.close()
+    out.close()
+    if src is not None:
+        src.close()
+    update_html(OUT, HTML)
 
 if __name__ == "__main__":
     main()
